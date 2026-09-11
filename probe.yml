@@ -1,0 +1,129 @@
+# .github/workflows/probe.yml
+#
+# Hyprax cloud probe - answers, in ONE ~3 minute run, whether the whole factory
+# can live on a free GitHub runner instead of a PC.
+#
+# Run it: repo -> Actions tab -> "Hyprax cloud probe" -> Run workflow.
+# Works from a phone browser. Nothing is installed anywhere and nothing is uploaded.
+#
+# It tests the four things we cannot know without trying:
+#   1. ffmpeg present and usable on the runner
+#   2. yt-dlp can read YouTube metadata from a datacenter IP   <- THE decisive one
+#   3. yt-dlp can actually pull bytes
+#   4. a Drive "anyone with the link" file is fetchable with no credentials
+#
+# Nothing here is secret, so this file is safe in a public repo.
+
+name: Hyprax cloud probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_url:
+        description: "YouTube URL to test with"
+        required: false
+        default: "https://www.youtube.com/watch?v=TJ2ifmkGGus"
+      drive_public_url:
+        description: "Optional: a Drive direct-download link to commands.json"
+        required: false
+        default: ""
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Runner basics
+        run: |
+          echo "::group::environment"
+          echo "date:   $(date -u)"
+          echo "public IP: $(curl -s --max-time 10 https://api.ipify.org || echo unknown)"
+          echo "python: $(python3 --version)"
+          echo "ffmpeg: $(ffmpeg -version 2>/dev/null | head -1 || echo 'MISSING')"
+          echo "::endgroup::"
+
+      - name: Install yt-dlp
+        run: |
+          python3 -m pip install --quiet --upgrade yt-dlp
+          echo "yt-dlp $(python3 -m yt_dlp --version)"
+
+      - name: "TEST 1 - can we READ YouTube metadata?"
+        id: meta
+        continue-on-error: true
+        run: |
+          set +e
+          python3 -m yt_dlp --no-playlist --dump-single-json --skip-download \
+            "${{ inputs.test_url }}" > meta.json 2> meta.err
+          rc=$?
+          if [ $rc -eq 0 ]; then
+            python3 - <<'PY'
+          import json
+          m = json.load(open("meta.json"))
+          print("PASS - title:", m.get("title"))
+          print("       uploader:", m.get("uploader"))
+          print("       duration:", m.get("duration"), "s")
+          PY
+            echo "ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "FAIL (exit $rc). yt-dlp said:"
+            tail -25 meta.err
+            echo "ok=false" >> $GITHUB_OUTPUT
+          fi
+          exit 0
+
+      - name: "TEST 2 - can we actually DOWNLOAD bytes?"
+        if: steps.meta.outputs.ok == 'true'
+        continue-on-error: true
+        run: |
+          set +e
+          # only the first ~30 seconds, lowest usable quality - this is a probe, not a job
+          python3 -m yt_dlp --no-playlist \
+            -f "worst[ext=mp4]/worst" \
+            --download-sections "*0-30" \
+            -o probe.%(ext)s "${{ inputs.test_url }}" 2> dl.err
+          rc=$?
+          if [ $rc -eq 0 ] && ls probe.* >/dev/null 2>&1; then
+            f=$(ls probe.* | head -1)
+            echo "PASS - got $f ($(du -h "$f" | cut -f1))"
+            ffprobe -v error -show_entries format=duration -of default=nw=1 "$f"
+          else
+            echo "FAIL (exit $rc):"; tail -25 dl.err
+          fi
+          exit 0
+
+      - name: "TEST 3 - can ffmpeg render a 9:16 clip?"
+        continue-on-error: true
+        run: |
+          set -e
+          ffmpeg -v error -y -f lavfi -i testsrc2=size=640x360:rate=30:duration=3 \
+            -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" \
+            -c:v libx264 -preset veryfast -pix_fmt yuv420p render.mp4
+          echo "PASS - $(ffprobe -v error -show_entries stream=width,height -of csv=p=0:s=x render.mp4 | head -1)"
+
+      - name: "TEST 4 - can we read the Drive control file with no credentials?"
+        if: inputs.drive_public_url != ''
+        continue-on-error: true
+        run: |
+          set +e
+          curl -sL --max-time 25 "${{ inputs.drive_public_url }}" -o cmd.json
+          if python3 -c "import json;d=json.load(open('cmd.json'));print('PASS - keys:', list(d)[:8])" 2>/dev/null; then
+            :
+          else
+            echo "FAIL - not JSON. First 200 bytes:"; head -c 200 cmd.json; echo
+            echo "(Usually means the link is not set to 'Anyone with the link',"
+            echo " or it is a /view link instead of a direct-download link.)"
+          fi
+          exit 0
+
+      - name: Verdict
+        run: |
+          echo "=========================================="
+          echo " metadata read : ${{ steps.meta.outputs.ok }}"
+          echo "=========================================="
+          if [ "${{ steps.meta.outputs.ok }}" = "true" ]; then
+            echo "PLAN A is open: the runner can source from YouTube directly."
+          else
+            echo "PLAN A is closed: YouTube refuses this datacenter IP."
+            echo "PLAN B still works - source from cleared assets (Vyro / Drive inbox)"
+            echo "instead of downloading. No YouTube fetch anywhere in the pipeline."
+          fi
