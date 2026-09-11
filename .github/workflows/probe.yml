@@ -1,18 +1,14 @@
 # .github/workflows/probe.yml
 #
-# Hyprax cloud probe - answers, in ONE ~3 minute run, whether the whole factory
-# can live on a free GitHub runner instead of a PC.
+# Hyprax cloud probe v2 - answers, in ONE run, whether the factory can live on a
+# free GitHub runner instead of a PC.
 #
-# Run it: repo -> Actions tab -> "Hyprax cloud probe" -> Run workflow.
-# Works from a phone browser. Nothing is installed anywhere and nothing is uploaded.
+# v2 fix: ffmpeg is NOT preinstalled on GitHub's ubuntu runners. v1 assumed it was
+# and TEST 3 died with exit 127 (command not found). Now it is installed explicitly,
+# and every step reports instead of exploding.
 #
-# It tests the four things we cannot know without trying:
-#   1. ffmpeg present and usable on the runner
-#   2. yt-dlp can read YouTube metadata from a datacenter IP   <- THE decisive one
-#   3. yt-dlp can actually pull bytes
-#   4. a Drive "anyone with the link" file is fetchable with no credentials
-#
-# Nothing here is secret, so this file is safe in a public repo.
+# Run it: Actions -> "Hyprax cloud probe" -> Run workflow. Works from a phone.
+# Nothing secret is in this file. Nothing is uploaded anywhere.
 
 name: Hyprax cloud probe
 
@@ -24,30 +20,38 @@ on:
         required: false
         default: "https://www.youtube.com/watch?v=TJ2ifmkGGus"
       drive_public_url:
-        description: "Optional: a Drive direct-download link to commands.json"
+        description: "Optional: Drive direct-download link to commands.json"
         required: false
         default: ""
 
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
-      - name: Runner basics
+      - name: "Runner basics"
+        continue-on-error: true
         run: |
-          echo "::group::environment"
-          echo "date:   $(date -u)"
-          echo "public IP: $(curl -s --max-time 10 https://api.ipify.org || echo unknown)"
-          echo "python: $(python3 --version)"
-          echo "ffmpeg: $(ffmpeg -version 2>/dev/null | head -1 || echo 'MISSING')"
-          echo "::endgroup::"
+          set +e
+          echo "date       : $(date -u)"
+          echo "public IP  : $(curl -s --max-time 10 https://api.ipify.org || echo unknown)"
+          echo "python3    : $(command -v python3 || echo MISSING)  $(python3 --version 2>&1)"
+          echo "ffmpeg     : $(command -v ffmpeg  || echo MISSING)"
+          echo "ffprobe    : $(command -v ffprobe || echo MISSING)"
+          exit 0
 
-      - name: Install yt-dlp
+      - name: "Install ffmpeg + yt-dlp"
+        continue-on-error: true
         run: |
+          set +e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg > /dev/null 2>&1
+          echo "ffmpeg now : $(ffmpeg -version 2>/dev/null | head -1 || echo 'STILL MISSING')"
           python3 -m pip install --quiet --upgrade yt-dlp
-          echo "yt-dlp $(python3 -m yt_dlp --version)"
+          echo "yt-dlp     : $(python3 -m yt_dlp --version 2>&1 || echo 'INSTALL FAILED')"
+          exit 0
 
-      - name: "TEST 1 - can we READ YouTube metadata?"
+      - name: "TEST 1 - can we READ YouTube metadata from this IP?"
         id: meta
         continue-on-error: true
         run: |
@@ -55,75 +59,88 @@ jobs:
           python3 -m yt_dlp --no-playlist --dump-single-json --skip-download \
             "${{ inputs.test_url }}" > meta.json 2> meta.err
           rc=$?
-          if [ $rc -eq 0 ]; then
-            python3 - <<'PY'
-          import json
-          m = json.load(open("meta.json"))
-          print("PASS - title:", m.get("title"))
-          print("       uploader:", m.get("uploader"))
-          print("       duration:", m.get("duration"), "s")
-          PY
+          if [ $rc -eq 0 ] && [ -s meta.json ]; then
+            python3 -c "import json;m=json.load(open('meta.json'));print('PASS');print(' title    :',m.get('title'));print(' uploader :',m.get('uploader'));print(' duration :',m.get('duration'),'s')"
             echo "ok=true" >> $GITHUB_OUTPUT
           else
             echo "FAIL (exit $rc). yt-dlp said:"
-            tail -25 meta.err
+            tail -30 meta.err
             echo "ok=false" >> $GITHUB_OUTPUT
           fi
           exit 0
 
       - name: "TEST 2 - can we actually DOWNLOAD bytes?"
-        if: steps.meta.outputs.ok == 'true'
+        id: dl
         continue-on-error: true
         run: |
           set +e
-          # only the first ~30 seconds, lowest usable quality - this is a probe, not a job
-          python3 -m yt_dlp --no-playlist \
-            -f "worst[ext=mp4]/worst" \
-            --download-sections "*0-30" \
-            -o probe.%(ext)s "${{ inputs.test_url }}" 2> dl.err
+          if [ "${{ steps.meta.outputs.ok }}" != "true" ]; then
+            echo "SKIPPED - metadata read already failed"; echo "ok=false" >> $GITHUB_OUTPUT; exit 0
+          fi
+          python3 -m yt_dlp --no-playlist -f "worst[ext=mp4]/worst" \
+            --download-sections "*0-30" -o "probe.%(ext)s" \
+            "${{ inputs.test_url }}" > dl.log 2> dl.err
           rc=$?
-          if [ $rc -eq 0 ] && ls probe.* >/dev/null 2>&1; then
-            f=$(ls probe.* | head -1)
+          f=$(ls probe.* 2>/dev/null | head -1)
+          if [ $rc -eq 0 ] && [ -n "$f" ]; then
             echo "PASS - got $f ($(du -h "$f" | cut -f1))"
-            ffprobe -v error -show_entries format=duration -of default=nw=1 "$f"
+            echo "ok=true" >> $GITHUB_OUTPUT
           else
-            echo "FAIL (exit $rc):"; tail -25 dl.err
+            echo "FAIL (exit $rc):"; tail -30 dl.err
+            echo "ok=false" >> $GITHUB_OUTPUT
           fi
           exit 0
 
-      - name: "TEST 3 - can ffmpeg render a 9:16 clip?"
+      - name: "TEST 3 - can ffmpeg render 9:16?"
+        id: render
         continue-on-error: true
         run: |
-          set -e
+          set +e
+          if ! command -v ffmpeg > /dev/null; then
+            echo "FAIL - ffmpeg still not available"; echo "ok=false" >> $GITHUB_OUTPUT; exit 0
+          fi
           ffmpeg -v error -y -f lavfi -i testsrc2=size=640x360:rate=30:duration=3 \
             -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" \
-            -c:v libx264 -preset veryfast -pix_fmt yuv420p render.mp4
-          echo "PASS - $(ffprobe -v error -show_entries stream=width,height -of csv=p=0:s=x render.mp4 | head -1)"
-
-      - name: "TEST 4 - can we read the Drive control file with no credentials?"
-        if: inputs.drive_public_url != ''
-        continue-on-error: true
-        run: |
-          set +e
-          curl -sL --max-time 25 "${{ inputs.drive_public_url }}" -o cmd.json
-          if python3 -c "import json;d=json.load(open('cmd.json'));print('PASS - keys:', list(d)[:8])" 2>/dev/null; then
-            :
+            -c:v libx264 -preset veryfast -pix_fmt yuv420p render.mp4 2> r.err
+          if [ -s render.mp4 ]; then
+            echo "PASS - $(ffprobe -v error -show_entries stream=width,height -of csv=p=0:s=x render.mp4 | head -1)"
+            echo "ok=true" >> $GITHUB_OUTPUT
           else
-            echo "FAIL - not JSON. First 200 bytes:"; head -c 200 cmd.json; echo
-            echo "(Usually means the link is not set to 'Anyone with the link',"
-            echo " or it is a /view link instead of a direct-download link.)"
+            echo "FAIL:"; tail -20 r.err; echo "ok=false" >> $GITHUB_OUTPUT
           fi
           exit 0
 
-      - name: Verdict
+      - name: "TEST 4 - Drive control file readable with no credentials?"
+        id: drive
+        continue-on-error: true
         run: |
-          echo "=========================================="
-          echo " metadata read : ${{ steps.meta.outputs.ok }}"
-          echo "=========================================="
-          if [ "${{ steps.meta.outputs.ok }}" = "true" ]; then
-            echo "PLAN A is open: the runner can source from YouTube directly."
+          set +e
+          if [ -z "${{ inputs.drive_public_url }}" ]; then
+            echo "SKIPPED - no URL given"; exit 0
+          fi
+          curl -sL --max-time 25 "${{ inputs.drive_public_url }}" -o cmd.json
+          python3 -c "import json;d=json.load(open('cmd.json'));print('PASS - keys:',list(d)[:8])" 2>/dev/null \
+            || { echo "FAIL - not JSON. First 200 bytes:"; head -c 200 cmd.json; echo; \
+                 echo "(Link is probably not 'Anyone with the link', or is a /view link not a direct-download link.)"; }
+          exit 0
+
+      - name: "VERDICT"
+        run: |
+          echo "================= HYPRAX CLOUD PROBE ================="
+          echo " ffmpeg render      : ${{ steps.render.outputs.ok }}"
+          echo " YouTube metadata   : ${{ steps.meta.outputs.ok }}"
+          echo " YouTube download   : ${{ steps.dl.outputs.ok }}"
+          echo "======================================================"
+          if [ "${{ steps.dl.outputs.ok }}" = "true" ]; then
+            echo "PLAN A IS OPEN."
+            echo "The runner can source from YouTube directly. Full cloud factory,"
+            echo "no PC anywhere in the loop."
+          elif [ "${{ steps.render.outputs.ok }}" = "true" ]; then
+            echo "PLAN B."
+            echo "YouTube refuses this datacenter IP, but rendering works fine."
+            echo "Source from cleared assets (Vyro / Drive inbox) instead of downloading."
+            echo "Still 100% cloud - just no yt-dlp step."
           else
-            echo "PLAN A is closed: YouTube refuses this datacenter IP."
-            echo "PLAN B still works - source from cleared assets (Vyro / Drive inbox)"
-            echo "instead of downloading. No YouTube fetch anywhere in the pipeline."
+            echo "NEITHER - rendering itself failed. Read TEST 3 above; this is"
+            echo "an install problem on the runner, not a YouTube problem."
           fi
